@@ -1,0 +1,3 @@
+# Use LF for TypeScript and YAML
+*.ts text eol=lf
+*.yml text eol=lf

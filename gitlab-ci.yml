@@ -1,0 +1,504 @@
+# BioNova CI/CD Pipeline Configuration
+# This file defines the CI/CD pipeline for the BioNova project
+# using GitLab CI/CD with modern job rules and optimized stages
+
+# Base image for all jobs unless overridden
+image: node:20
+
+# Define pipeline stages in order of execution
+stages:
+  - lint
+  - test
+  - build
+  - docker
+  - deploy
+  - cleanup
+
+# Global variables and configurations
+variables:
+  NODE_ENV: development
+  CACHE_KEY: $CI_COMMIT_REF_SLUG # Cache key based on branch/tag
+  # Docker configuration
+  DOCKER_IMAGE_BASE_NAME: $CI_REGISTRY_IMAGE # Uses GitLab's predefined variable for image name
+  # DOCKER_TAG will be set dynamically in the build_docker script for sanitization
+  # Build paths
+  FRONTEND_BUILD_DIR: frontend/out # Assuming Next.js static export path
+  BACKEND_BUILD_DIR: backend/dist
+  # SSH deployment - Replace with your actual values
+  SSH_DEPLOY_HOST: "your-ssh-deploy-host.example.com"
+  SSH_DEPLOY_USER: "deploy-user"
+  SSH_DEPLOY_PATH: "/var/www/bionova"
+  # Environment URLs - Replace with your actual URLs
+  PROD_URL: "https://bionova.vercel.app/"
+  STATIC_URL_MAIN: "https://your-bionova-main.netlify.app"
+  # PREVIEW_URL for Netlify will be dynamic, STATIC_URL_MAIN is for the main branch deployment
+
+# Cache configuration for node_modules and build artifacts
+# Caching node_modules per project directory for better isolation
+.cache_template: &cache_definition
+  key:
+    files:
+      - package-lock.json
+      - yarn.lock
+    prefix: ${CI_COMMIT_REF_SLUG}-${CI_JOB_NAME}
+  paths:
+    - node_modules/
+  policy: pull-push
+
+frontend_cache:
+  <<: *cache_definition
+  key:
+    files:
+      - frontend/package-lock.json
+      - frontend/yarn.lock
+    prefix: ${CI_COMMIT_REF_SLUG}-frontend
+  paths:
+    - frontend/node_modules/
+
+backend_cache:
+  <<: *cache_definition
+  key:
+    files:
+      - backend/package-lock.json
+      - backend/yarn.lock
+    prefix: ${CI_COMMIT_REF_SLUG}-backend
+  paths:
+    - backend/node_modules/
+
+# YAML Anchors for reusable rule sets
+.rules_standard_workflow: &rules_standard_workflow
+  - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  - if: '$CI_COMMIT_BRANCH =~ /^feature\// && $CI_PIPELINE_SOURCE == "push"'
+
+.rules_main_branch_push_only: &rules_main_branch_push_only
+  - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+
+# Linting Stage
+frontend_lint:
+  stage: lint
+  cache: !reference [frontend_cache]
+  before_script:
+    - cd frontend
+    - npm ci --no-audit
+  script:
+    - npm run lint
+  rules: *rules_standard_workflow
+  allow_failure: false
+
+backend_lint:
+  stage: lint
+  cache: !reference [backend_cache]
+  before_script:
+    - cd backend
+    - npm ci --no-audit
+  script:
+    - npm run lint
+  rules: *rules_standard_workflow
+  allow_failure: false
+
+# Testing Stage
+frontend_test:
+  stage: test
+  cache: !reference [frontend_cache]
+  before_script:
+    - cd frontend
+    - npm ci --no-audit
+  script:
+    - npm run test
+  rules: *rules_standard_workflow
+  allow_failure: false
+  needs: [frontend_lint]
+
+backend_test:
+  stage: test
+  cache: !reference [backend_cache]
+  before_script:
+    - cd backend
+    - npm ci --no-audit
+  script:
+    - npm run test
+  rules: *rules_standard_workflow
+  allow_failure: false
+  needs: [backend_lint]
+
+# Build Stage
+frontend_build:
+  stage: build
+  cache: !reference [frontend_cache]
+  before_script:
+    - cd frontend
+    - npm ci --no-audit
+  script:
+    - npm run build # This should produce static assets in $FRONTEND_BUILD_DIR (e.g., frontend/out)
+  artifacts:
+    paths:
+      - $FRONTEND_BUILD_DIR
+    expire_in: 1 week
+  rules: *rules_standard_workflow
+  needs: [frontend_test]
+
+backend_build:
+  stage: build
+  cache: !reference [backend_cache]
+  before_script:
+    - cd backend
+    - npm ci --no-audit
+  script:
+    - npm run build # This should produce distributable files in $BACKEND_BUILD_DIR
+  artifacts:
+    paths:
+      - $BACKEND_BUILD_DIR
+    expire_in: 1 week
+  rules: *rules_standard_workflow
+  needs: [backend_test]
+
+# Smart Contracts (Main branch push only)
+smart_contracts:
+  stage: build
+  cache: !reference [frontend_cache] # Assuming smart contract scripts are in frontend
+  before_script:
+    - cd frontend
+    - npm ci --no-audit
+  script:
+    - npm run compile-contracts
+    - npm run deploy-contracts # Ensure this script handles idempotency or environment checks
+  rules: *rules_main_branch_push_only
+  needs: [frontend_build]
+
+# Docker Stage
+build_docker:
+  image: docker:20.10.16 # Specify a more concrete version
+  services:
+    - docker:20.10.16-dind
+  stage: docker
+  before_script: [] # No npm installs needed here
+  script:
+    # Sanitize CI_COMMIT_REF_SLUG to be a valid Docker tag
+    - DOCKER_TAG_SANITIZED=$(echo "$CI_COMMIT_REF_SLUG" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_.-' '_' | sed 's/[^[:alnum:]_.-]/_/g; s/^-*//;s/-*$//' | cut -c 1-128)
+    - if [ -z "$DOCKER_TAG_SANITIZED" ]; then DOCKER_TAG_SANITIZED="unknown"; fi
+    - echo "Logging into Docker registry $CI_REGISTRY..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - IMAGE_NAME_WITH_TAG="$DOCKER_IMAGE_BASE_NAME:$DOCKER_TAG_SANITIZED"
+    - echo "Building Docker image: $IMAGE_NAME_WITH_TAG"
+    - docker build -t "$IMAGE_NAME_WITH_TAG" .
+    - echo "Pushing Docker image: $IMAGE_NAME_WITH_TAG"
+    - docker push "$IMAGE_NAME_WITH_TAG"
+    - if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        echo "Tagging $IMAGE_NAME_WITH_TAG as $DOCKER_IMAGE_BASE_NAME:latest"
+        docker tag "$IMAGE_NAME_WITH_TAG" "$DOCKER_IMAGE_BASE_NAME:latest"
+        echo "Pushing Docker image: $DOCKER_IMAGE_BASE_NAME:latest"
+        docker push "$DOCKER_IMAGE_BASE_NAME:latest"
+      fi
+  rules: *rules_main_branch_push_only
+  needs:
+    - frontend_build # Ensure build artifacts are available if Dockerfile copies them
+    - backend_build
+
+# Deployment Stage
+# VM Deployment (Main branch push only)
+deploy_vm:
+  stage: deploy
+  image: alpine:latest # Minimal image with sh; install packages as needed
+  before_script:
+    - apk add --no-cache openssh-client rsync bash
+  script:
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa # Ensure SSH_PRIVATE_KEY is base64 encoded
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H "$SSH_DEPLOY_HOST" >> ~/.ssh/known_hosts
+    - echo "Deploying frontend to $SSH_DEPLOY_USER@$SSH_DEPLOY_HOST:$SSH_DEPLOY_PATH/frontend"
+    - rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa" $FRONTEND_BUILD_DIR/ "$SSH_DEPLOY_USER@$SSH_DEPLOY_HOST:$SSH_DEPLOY_PATH/frontend/"
+    - echo "Deploying backend to $SSH_DEPLOY_USER@$SSH_DEPLOY_HOST:$SSH_DEPLOY_PATH/backend"
+    - rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa" $BACKEND_BUILD_DIR/ "$SSH_DEPLOY_USER@$SSH_DEPLOY_HOST:$SSH_DEPLOY_PATH/backend/"
+    # Add commands to restart your application on the VM if needed, e.g.:
+    # - ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa "$SSH_DEPLOY_USER@$SSH_DEPLOY_HOST" "cd $SSH_DEPLOY_PATH && docker-compose restart" 
+  rules: *rules_main_branch_push_only
+  environment:
+    name: production/vm
+    url: $PROD_URL
+  needs:
+    - frontend_build
+    - backend_build
+
+# Static Site Deployment (Netlify - Main push and Feature branch MRs)
+deploy_static:
+  stage: deploy
+  cache: !reference [frontend_cache]
+  before_script:
+    - cd frontend
+    - npm ci --no-audit
+  script:
+    - npm run export # Ensure this command generates files in $FRONTEND_BUILD_DIR (frontend/out)
+    - echo "Deploying static site to Netlify..."
+    # NETLIFY_BUILD_HOOK should be a secret variable in GitLab CI/CD settings
+    - NETLIFY_HOOK_URL="https://api.netlify.com/build_hooks/$NETLIFY_BUILD_HOOK"
+    - echo "Triggering Netlify build hook: $NETLIFY_HOOK_URL"
+    - RESPONSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$NETLIFY_HOOK_URL")
+    - echo "Netlify API response code: $RESPONSE_CODE"
+    - if [ "$RESPONSE_CODE" -eq 200 ] || [ "$RESPONSE_CODE" -eq 201 ] || [ "$RESPONSE_CODE" -eq 204 ]; then
+        echo "Netlify deployment triggered successfully."
+      else
+        echo "Netlify deployment trigger failed with HTTP status $RESPONSE_CODE"
+        exit 1
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      environment:
+        name: production/static
+        url: $STATIC_URL_MAIN
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\// && $CI_PIPELINE_SOURCE == "merge_request_event"'
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG # Creates a dynamic environment for review apps
+        # Netlify typically provides a unique preview URL. This might need to be fetched or constructed.
+        # url: set dynamically or use a placeholder if not easily determined
+  needs:
+    - frontend_build # Only needs frontend for static export
+
+# Kubernetes Deployment (Main branch push only)
+deploy_k8s:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script: []
+  script:
+    # KUBECONFIG should be a File type secret variable in GitLab CI/CD settings
+    # or its content base64 encoded in a regular variable.
+    # Assuming KUBECONFIG_BASE64 content here:
+    - echo "$KUBECONFIG_BASE64" | base64 -d > /tmp/kubeconfig
+    - export KUBECONFIG=/tmp/kubeconfig
+    - echo "Applying Kubernetes manifests..."
+    # Example: Update image for a deployment
+    # - kubectl set image deployment/your-app-deployment your-app-container=$DOCKER_IMAGE_BASE_NAME:latest -n your-namespace
+    # Example: Apply a kustomization
+    # - kubectl apply -k k8s/overlays/production
+    - echo "Kubernetes deployment logic needs to be implemented here."
+    - rm /tmp/kubeconfig # Clean up kubeconfig file
+  rules: *rules_main_branch_push_only
+  environment:
+    name: production/kubernetes
+    url: $PROD_URL # Or a specific K8s service ingress URL
+  needs:
+    - build_docker
+
+# Cleanup Stage
+cleanup_workspace:
+  stage: cleanup
+  before_script: []
+  script:
+    - echo "Cleaning up workspace..."
+    # This job can be used to remove any temporary files created during the pipeline if not handled by artifacts.
+    # GitLab runners typically clean the workspace between jobs, so this is often not strictly necessary.
+    # Example: rm -rf ./temp_files_not_needed_elsewhere/
+  rules: *rules_main_branch_push_only # Run on main branch pushes, or adjust as needed
+  when: always # Ensures it runs even if previous stages fail (if allow_failure is true on them)
+  allow_failure: true # Cleanup should not fail the pipeline
+  needs: [] # Runs independently at the end of its stage
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+backend_lint:
+  stage: lint
+  script:
+    - cd backend && npm run lint
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Testing Stage
+# Runs automated tests for both frontend and backend
+frontend_test:
+  stage: test
+  script:
+    - cd frontend && npm run test
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+backend_test:
+  stage: test
+  script:
+    - cd backend && npm run test
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Build Stage
+# Builds frontend and backend applications
+frontend_build:
+  stage: build
+  script:
+    - cd frontend && npm run build
+  artifacts:
+    paths:
+      - $FRONTEND_BUILD_DIR
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+backend_build:
+  stage: build
+  script:
+    - cd backend && npm run build
+  artifacts:
+    paths:
+      - $BACKEND_BUILD_DIR
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Smart Contracts (Main branch only)
+smart_contracts:
+  stage: build
+  script:
+    - cd frontend && npm run compile-contracts
+    - cd frontend && npm run deploy-contracts
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Docker Stage
+# Builds and pushes Docker image to registry
+build_docker:
+  image: docker:20
+  services:
+    - docker:dind
+  stage: docker
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $DOCKER_REGISTRY
+    - docker build -t $DOCKER_IMAGE_NAME:$DOCKER_TAG .
+    - docker push $DOCKER_IMAGE_NAME:$DOCKER_TAG
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - frontend_build
+    - backend_build
+
+# Deployment Stage
+# VM Deployment (Main branch only)
+deploy_vm:
+  stage: deploy
+  image: ruby:3.1
+  script:
+    - apt-get update -qq && apt-get install -qqy openssh-client
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H $SSH_DEPLOY_HOST >> ~/.ssh/known_hosts
+    - ssh -o StrictHostKeyChecking=no $SSH_DEPLOY_USER@$SSH_DEPLOY_HOST "mkdir -p $SSH_DEPLOY_PATH"
+    - rsync -avz -e "ssh -o StrictHostKeyChecking=no" $FRONTEND_BUILD_DIR/ $SSH_DEPLOY_USER@$SSH_DEPLOY_HOST:$SSH_DEPLOY_PATH/frontend/
+    - rsync -avz -e "ssh -o StrictHostKeyChecking=no" $BACKEND_BUILD_DIR/ $SSH_DEPLOY_USER@$SSH_DEPLOY_HOST:$SSH_DEPLOY_PATH/backend/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  environment:
+    name: production
+    url: https://your-production-url.com
+  needs:
+    - frontend_build
+    - backend_build
+
+# Static Site Deployment (Main and Feature branches)
+deploy_static:
+  stage: deploy
+  script:
+    - cd frontend && npm run export
+    - echo "Deploying static site to Netlify..."
+    - curl -X POST "https://api.netlify.com/build_hooks/$NETLIFY_BUILD_HOOK" \
+      -H "Content-Type: application/json" \
+      --data "{\"site_id\":\"$NETLIFY_SITE_ID\"}" \
+      -w "\nResponse: %{http_code}\n" \
+      -o /dev/null
+    - if [ $? -ne 0 ]; then
+        echo "Netlify deployment failed"
+        exit 1
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature/ && $CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        NETLIFY_ENV: preview
+  environment:
+    name: static
+    url: https://your-static-url.com
+
+# Kubernetes Deployment (Main branch only)
+deploy_k8s:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  script:
+    - echo "$KUBECONFIG" | base64 -d > kubeconfig
+    - kubectl apply -f k8s/deployment.yaml
+    - kubectl apply -f k8s/service.yaml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  environment:
+    name: k8s
+    url: https://your-k8s-url.com
+  needs:
+    - build_docker
+
+# Cache Cleanup (Main branch only)
+cleanup_cache:
+  stage: deploy
+  after_script:
+    - echo "Cleaning up cache..."
+    - rm -rf node_modules/ frontend/.next/ backend/dist/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  when: on_failure
+  allow_failure: true
+
+# Remove duplicate and unused jobs
+# Removed:
+# - frontend:test (duplicate of frontend_test)
+# - deploy (empty placeholder)
+# - Any other duplicate job definitions
+backend:test:
+  stage: test
+  script:
+    - cd backend && npm test
+
+frontend:build:
+  stage: build
+  script:
+    - cd frontend && npm run build
+  artifacts:
+    paths:
+      - frontend/.next/
+    expire_in: 1 week
+
+backend:build:
+  stage: build
+  script:
+    - cd backend && npm run build
+  artifacts:
+    paths:
+      - backend/dist/
+    expire_in: 1 week
+
+smart-contracts:
+  stage: build
+  script:
+    - cd frontend && npm run compile-contracts
+    - cd frontend && npm run deploy-contracts
+  only:
+    - main
+
+pages:
+  stage: deploy
+  script:
+    - cd frontend && npm run export
+  artifacts:
+    paths:
+      - frontend/out
+  only:
+    - main
+
+deploy:
+  stage: deploy
+  only:
+    - main
+  script:
+    - echo "Deploying to production..."
+    - # Add your deployment script here
+    - # For example, using Docker:
+    # docker build -t your-image-name .
+    # docker push your-image-name
+  environment:
+    name: production
+    url: https://bionova.vercel.app/

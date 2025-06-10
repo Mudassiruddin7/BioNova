@@ -1,0 +1,8 @@
+torch
+transformers
+protobuf
+einops
+accelerate
+fastapi
+uvicorn
+numpy

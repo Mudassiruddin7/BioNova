@@ -1,0 +1,6 @@
+<svg width="10" height="10" xmlns="http://www.w3.org/2000/svg">
+  <pattern id="scanlines" width="10" height="10" patternUnits="userSpaceOnUse">
+    <line x1="0" y1="1" x2="10" y2="1" stroke="#fff" stroke-width="0.5" stroke-opacity="0.2"/>
+  </pattern>
+  <rect width="100%" height="100%" fill="url(#scanlines)" />
+</svg> 
